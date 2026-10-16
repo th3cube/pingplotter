@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!requirements.txt
+!alerts.py
+!api.py
+!baseline.py
+!collector.py
+!digest.py
+!main.py
+!speedtest_runner.py
+!storage.py
+!static/
+!static/**

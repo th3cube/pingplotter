@@ -1,0 +1,225 @@
+name: Container images
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Validate source and version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+      release: ${{ steps.meta.outputs.release }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Validate image metadata
+        id: meta
+        run: |
+          python scripts/image_tags.py --repository "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF" --sha "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          fi
+      - name: Install locked test dependencies
+        run: python -m pip install --require-hashes -r requirements-dev.txt
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build and test ${{ matrix.arch }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Enable OCI image loading
+        uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5
+        with:
+          daemon-config: |
+            {"features": {"containerd-snapshotter": true}}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Build OCI image with SBOM and provenance
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          tags: ${{ needs.validate.outputs.image }}:check
+          labels: |
+            org.opencontainers.image.title=PingPlotter
+            org.opencontainers.image.description=Self-hosted network monitoring dashboard
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+          outputs: type=oci,dest=${{ runner.temp }}/image-${{ matrix.arch }}.tar
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=pingplotter-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pingplotter-${{ matrix.arch }}
+      - name: Test the image that will be published
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker load --input "$RUNNER_TEMP/image-$ARCH.tar"
+          python3 scripts/smoke_image.py "$IMAGE:check" --host-network
+      - name: Retain tested OCI archive for publication
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: oci-${{ matrix.arch }}
+          path: ${{ runner.temp }}/image-${{ matrix.arch }}.tar
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    name: Publish tested images
+    if: github.event_name != 'pull_request'
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-publish-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      latest: ${{ steps.tags.outputs.latest }}
+      digest: ${{ steps.manifest.outputs.digest }}
+    env:
+      IMAGE: ${{ needs.validate.outputs.image }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: oci-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/images
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install OCI transfer tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo
+      - name: Transfer tested images without rebuilding
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          authfile="$RUNNER_TEMP/registry-auth.json"
+          trap 'rm -f "$authfile"' EXIT
+          printf '%s' "$GH_TOKEN" | skopeo login --authfile "$authfile" \
+            --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          for arch in amd64 arm64; do
+            skopeo copy --all --preserve-digests --authfile "$authfile" \
+              "oci-archive:$RUNNER_TEMP/images/image-$arch.tar" \
+              "docker://$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$arch"
+          done
+          skopeo list-tags --authfile "$authfile" "docker://$IMAGE" > "$RUNNER_TEMP/existing-tags.json"
+      - name: Select version tags without overwriting releases
+        id: tags
+        run: |
+          args=()
+          if [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_SHA" == "$(git rev-parse origin/main)" ]]; then
+            args+=(--current-main)
+          fi
+          python3 scripts/image_tags.py --repository "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF" --sha "$GITHUB_SHA" \
+            --existing-tags "$RUNNER_TEMP/existing-tags.json" "${args[@]}" >> "$GITHUB_OUTPUT"
+      - name: Create and verify multi-platform manifest
+        id: manifest
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          args=()
+          IFS=',' read -ra tags <<< "$TAGS"
+          for tag in "${tags[@]}"; do args+=(--tag "$tag"); done
+          docker buildx imagetools create "${args[@]}" \
+            "$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-amd64" \
+            "$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-arm64"
+          docker buildx imagetools inspect "${tags[0]}" --raw > "$RUNNER_TEMP/manifest.json"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads((Path(os.environ['RUNNER_TEMP']) / 'manifest.json').read_text())
+          platforms = {m['platform']['architecture'] for m in manifest['manifests'] if m['platform']['os'] == 'linux'}
+          assert platforms == {'amd64', 'arm64'}, platforms
+          attestations = [m for m in manifest['manifests'] if m.get('annotations', {}).get('vnd.docker.reference.type') == 'attestation-manifest']
+          assert len(attestations) == 2, 'Missing platform attestations'
+          PY
+          digest=$(docker buildx imagetools inspect "${tags[0]}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Published PingPlotter image'
+            echo
+            for tag in "${tags[@]}"; do printf -- '- `docker pull %s`\n' "$tag"; done
+            printf '\nDigest: `%s@%s`\n' "$IMAGE" "$digest"
+            echo
+            echo 'Platforms: linux/amd64, linux/arm64. SBOM and provenance included.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Create GitHub release
+    needs: [validate, publish]
+    if: needs.validate.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      IMAGE: ${{ needs.validate.outputs.image }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      IS_LATEST: ${{ needs.publish.outputs.latest }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Publish release notes and image reference
+        run: |
+          args=(--latest=false)
+          if [[ "$PRERELEASE" == true ]]; then args+=(--prerelease); fi
+          if [[ "$IS_LATEST" == true ]]; then args=(--latest); fi
+          printf 'Docker image: `%s:%s`\n\nDigest: `%s@%s`\n\nPlatforms: Linux AMD64 and ARM64.\n' \
+            "$IMAGE" "$VERSION" "$IMAGE" "$DIGEST" > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/release-notes.md" "${args[@]}"
