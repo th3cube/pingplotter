@@ -161,7 +161,9 @@ def test_repeated_restart_always_keeps_exactly_one_live_thread(isolate_collector
             old_thread.join(timeout=2.0)
             assert not old_thread.is_alive(), f"iteration {i}: old thread for device 1 is still running"
 
-        seen_threads.add(new_thread.ident)
+        # OS thread identifiers can be reused after join. Keep the actual
+        # Thread objects so this checks fresh threads on every platform.
+        seen_threads.add(new_thread)
 
         # A little run time between restarts, like real usage (edits aren't
         # usually back-to-back with zero delay).

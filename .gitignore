@@ -5,3 +5,8 @@ data/
 *.zip
 .claude/
 docs/superpowers/
+.env
+.env.*
+!.env.example
+.venv/
+.pytest_cache/

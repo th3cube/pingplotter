@@ -256,3 +256,164 @@ All data lives in `data/` (created automatically on first run):
 | `data/alerts.csv` | Alert history |
 | `data/speedtest.csv` | Speedtest history |
 | `data/baseline.json` | Per-device rolling avg/jitter baselines |
+
+---
+
+## Docker images
+
+GitHub Actions builds this fork for **Linux AMD64 and ARM64** and publishes the
+tested images to **`ghcr.io/th3cube/pingplotter`**. Docker automatically selects
+the matching platform. Each published image includes source/commit/version
+labels, an SBOM, and build provenance.
+
+### Run on a Linux server
+
+Create a `.env` file next to your Compose file:
+
+```dotenv
+PINGPLOTTER_TOKEN=replace-with-a-long-random-secret
+```
+
+Do not commit this file. For example, generate a token with
+`openssl rand -hex 32`.
+
+```yaml
+services:
+  pingplotter:
+    image: ghcr.io/th3cube/pingplotter:0.1.0
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    environment:
+      PINGPLOTTER_HOST: 0.0.0.0
+      PINGPLOTTER_PORT: "8000"
+      PINGPLOTTER_TOKEN: ${PINGPLOTTER_TOKEN:?Set PINGPLOTTER_TOKEN in .env}
+    volumes:
+      - pingplotter-data:/app/data
+
+volumes:
+  pingplotter-data:
+```
+
+Save as `compose.yaml`, then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Open `http://YOUR-SERVER-IP:8000`. Host networking uses the server's network
+directly, so omit `ports:` and ensure port 8000 is free. The container does not
+need `privileged: true`. This Compose example is for Linux; with Docker Desktop,
+use bridge networking and `ports: ["127.0.0.1:8000:8000"]` instead of
+`network_mode: host`, unless Desktop host networking is explicitly enabled.
+
+The named volume preserves configuration, settings, and history when replacing
+the container. Back it up before upgrading; `docker compose down -v` deletes it.
+To roll back an image, select an earlier full version and recreate the container.
+The existing application token mechanism also applies to container deployments;
+send it with API requests as described in [Authentication](#authentication).
+
+### Image tags
+
+| Tag | Meaning |
+|---|---|
+| `0.1.0` | A complete stable version, published from Git tag `v0.1.0` |
+| `latest` | Highest published stable version |
+| `edge` | Most recent successfully tested current `main` commit |
+| `sha-0123456789ab` | A particular development commit |
+| `1.0.0-rc.1` | A prerelease; never changes `latest` |
+
+Use a full version or `image@sha256:DIGEST` in production. The `edge` and `latest`
+tags move. CI refuses to overwrite a published complete version. To publish
+changed source or rebuilt dependencies, use a new version tag. Publishing an
+older version does not move `latest` backwards.
+
+### GitHub setup
+
+1. In the fork's **Actions** tab, enable workflows if GitHub requests it.
+2. Merge the Docker pipeline pull request into `main`. The push automatically
+   runs tests and publishes the first `edge` image.
+3. Under your GitHub profile's **Packages**, open `pingplotter`, select
+   **Package settings → Change visibility → Public**. GHCR creates new packages
+   as private, even for public repositories. This one-time setting allows
+   anonymous pulls. The image's source label links it to this repository.
+4. Confirm that **Settings → Actions → General** permits the pinned actions.
+   The workflow itself grants `packages: write` only to the publish job and
+   `contents: write` only to the GitHub release job.
+
+No personal access token or repository secret is needed for publishing: the
+workflow uses GitHub's short-lived `GITHUB_TOKEN`. The **Run workflow** button
+on `main` can rebuild the development image. Pull requests only test and never
+authenticate to GHCR or publish images. Do not use `pull_request_target` to run
+untrusted pull request code.
+
+### Publish a release
+
+After the pipeline is merged, update your local `main` and tag the desired commit:
+
+```bash
+git switch main
+git pull --ff-only
+git tag -a v0.1.0 -m "PingPlotter container release 0.1.0"
+git push origin v0.1.0
+```
+
+For later releases use a new SemVer tag such as `v0.1.1` or `v1.0.0`. A
+prerelease tag such as `v1.0.0-rc.1` creates only the prerelease image and a GitHub
+prerelease. Tags must point to commits contained in `main`. Version build metadata
+(`+build`) is not supported because `+` is not valid in Docker tags.
+
+The workflow runs the Python tests, builds on native AMD64 and ARM64 runners,
+and tests the actual images for HTTP, API authentication, ICMP, traceroute,
+health, and data persistence. Tested OCI archives are transferred to GHCR
+without rebuilding. A final job combines both platforms, preserves attestations,
+and publishes the public tags only after both builds pass. Temporary
+`build-RUN-ATTEMPT-ARCH` tags are transfer artifacts, not release versions.
+
+Successful version builds create a GitHub Release with generated notes and image
+references. Open the workflow's **Summary** for tags, pull commands, and digest.
+If publication fails after a version tag was written, inspect the existing image
+and use a new version rather than overwriting it. If only release-note creation
+fails, rerun the failed release job, not the completed publish job.
+
+After making the GHCR package public, verify without saved registry credentials:
+
+```bash
+docker --config "$(mktemp -d)" pull ghcr.io/th3cube/pingplotter:0.1.0
+docker buildx imagetools inspect ghcr.io/th3cube/pingplotter:0.1.0
+```
+
+### Local build and checks
+
+```bash
+docker build -t pingplotter:local .
+python3 scripts/smoke_image.py pingplotter:local
+```
+
+The smoke test uses a disposable volume, random localhost port, and loopback
+probes; it does not run bandwidth tests. On Linux, add `--host-network` to test
+the host-network configuration too.
+
+Install test dependencies into a Python 3.12 virtual environment:
+
+```bash
+python -m pip install --require-hashes -r requirements-dev.txt
+python -m pytest -q
+```
+
+`requirements.in` contains runtime dependencies. `requirements-dev.in` adds
+test tools. Both `.txt` files are generated universal locks with hashes; do not
+edit them manually. To intentionally refresh the locks using `uv`:
+
+```bash
+uv pip compile requirements.in --python-version 3.12 --universal --generate-hashes --upgrade --output-file requirements.txt
+uv pip compile requirements-dev.in --python-version 3.12 --universal --generate-hashes --upgrade --output-file requirements-dev.txt
+```
+
+Review both lock files and run the tests before merging. Dependabot checks the
+Docker base image digest and pinned GitHub Actions weekly. Upstream application
+changes are incorporated by syncing the fork and reviewing the resulting tests.
