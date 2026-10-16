@@ -353,7 +353,19 @@ untrusted pull request code.
 
 ### Publish a release
 
-After the pipeline is merged, update your local `main` and tag the desired commit:
+You can create a version entirely in the GitHub interface:
+
+1. Open **Actions → Create version tag → Run workflow**.
+2. Select branch **main** and enter a new tag such as `v0.1.1`.
+3. Run the workflow. It validates the version, creates an annotated tag, and
+   explicitly starts **Container images** on that tag.
+
+The initial installation of this workflow bootstraps `v0.1.0` once. Subsequent
+workflow-file edits do not create versions. A new release always requires a new
+tag. If tag creation succeeded but dispatch failed, manually run **Container
+images** on the existing version tag instead of recreating it.
+
+Alternatively, update your local `main` and push an annotated tag:
 
 ```bash
 git switch main

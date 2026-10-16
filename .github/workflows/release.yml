@@ -1,0 +1,71 @@
+name: Create version tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version tag, for example v0.1.1 or v1.0.0-rc.1'
+        required: true
+        type: string
+  # Bootstrap the agreed first release once, when this workflow is introduced.
+  push:
+    branches: [main]
+    paths: [.github/workflows/release.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: create-version-tag-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  create-tag:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if git cat-file -e "$BEFORE:.github/workflows/release.yml" 2>/dev/null; then
+              echo 'Workflow already installed; bootstrap is not needed.'
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            INPUT_VERSION=v0.1.0
+          fi
+          python3 scripts/image_tags.py --repository "$GITHUB_REPOSITORY" \
+            --ref "refs/tags/$INPUT_VERSION" --sha "$GITHUB_SHA" > /dev/null
+          echo "tag=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Create annotated tag and start image pipeline
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          tag_sha=$(gh api --method POST "repos/$GH_REPO/git/tags" \
+            -f tag="$VERSION_TAG" -f message="PingPlotter container release $VERSION_TAG" \
+            -f object="$GITHUB_SHA" -f type=commit --jq '.sha')
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f ref="refs/tags/$VERSION_TAG" -f sha="$tag_sha"
+          # GITHUB_TOKEN-created tags do not trigger push workflows. Explicit
+          # dispatch does trigger workflows and uses exactly the tagged source.
+          gh workflow run images.yml --ref "$VERSION_TAG"
+          {
+            printf '### Created `%s`\n\n' "$VERSION_TAG"
+            printf 'Commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'The Container images workflow is building this version. [View runs](https://github.com/%s/actions/workflows/images.yml).\n' "$GH_REPO"
+          } >> "$GITHUB_STEP_SUMMARY"
